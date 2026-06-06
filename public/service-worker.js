@@ -1,11 +1,13 @@
-// Service worker simples: cache do app shell para abrir offline.
-// Requisições de API e upload sempre vão à rede.
-const CACHE = 'motores-v1';
+// Service worker: cache do app shell para abrir e operar OFFLINE.
+// Requisições de API/autenticação sempre vão à rede (e falham graciosamente offline,
+// pois o app salva localmente e sincroniza depois).
+const CACHE = 'motores-v2';
 const SHELL = [
   '/',
   '/index.html',
   '/styles.css',
   '/app.js',
+  '/db.js',
   '/manifest.webmanifest',
   '/icons/icon-192.png',
   '/icons/icon-512.png',
@@ -22,18 +24,28 @@ self.addEventListener('activate', (e) => {
 });
 
 self.addEventListener('fetch', (e) => {
-  const url = new URL(e.request.url);
-  // Nunca interceptar API, autenticação ou métodos não-GET.
-  if (e.request.method !== 'GET' || url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth/')) {
+  const { request } = e;
+  const url = new URL(request.url);
+
+  // Nunca interceptar API/autenticação ou métodos não-GET.
+  if (request.method !== 'GET' || url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth/')) {
     return;
   }
+
+  // Navegações (abrir o app): tenta a rede, cai para o app shell em cache (offline).
+  if (request.mode === 'navigate') {
+    e.respondWith(fetch(request).catch(() => caches.match('/index.html').then((r) => r || caches.match('/'))));
+    return;
+  }
+
+  // Demais GETs do mesmo domínio: cache-first com atualização em segundo plano.
   e.respondWith(
-    caches.match(e.request).then((cached) => {
-      const network = fetch(e.request)
+    caches.match(request).then((cached) => {
+      const network = fetch(request)
         .then((res) => {
           if (res.ok && url.origin === location.origin) {
             const copy = res.clone();
-            caches.open(CACHE).then((c) => c.put(e.request, copy));
+            caches.open(CACHE).then((c) => c.put(request, copy));
           }
           return res;
         })

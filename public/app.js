@@ -38,12 +38,14 @@ const state = {
   dados: emptyDados(),
   naoLegiveis: [],
   aiUsed: false,
+  aiDeferred: false,
   vezesRebobinado: '',
   extras: [], // {file, url, name}
   observacoes: '',
   mode: 'create',
   existe: false,
   result: null,
+  pendentes: 0,
 };
 
 const appEl = document.getElementById('app');
@@ -61,7 +63,7 @@ function toast(msg) {
   t.textContent = msg;
   t.hidden = false;
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => (t.hidden = true), 3200);
+  toast._t = setTimeout(() => (t.hidden = true), 3600);
 }
 
 function go(step) {
@@ -79,9 +81,6 @@ function renderProgress() {
   progressEl.innerHTML = FLUXO.map((_, i) => `<span class="${i <= idx ? 'done' : ''}"></span>`).join('');
 }
 
-// ---------------------------------------------------------------------------
-// Renderização principal
-// ---------------------------------------------------------------------------
 function render() {
   renderProgress();
   const fn = VIEWS[state.step] || VIEWS.start;
@@ -97,12 +96,38 @@ function card(html) {
   return div;
 }
 
+function rotulo(key) {
+  const c = CAMPOS.find((x) => x.key === key);
+  return c ? c.label : key;
+}
+
+/** Comprime/redimensiona a foto no próprio navegador (não precisa de servidor). */
+async function compressImage(file, max = 2000, quality = 0.82) {
+  try {
+    const bmp = await createImageBitmap(file);
+    let { width, height } = bmp;
+    const scale = Math.min(1, max / Math.max(width, height));
+    width = Math.round(width * scale);
+    height = Math.round(height * scale);
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext('2d').drawImage(bmp, 0, 0, width, height);
+    bmp.close && bmp.close();
+    const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', quality));
+    return blob || file;
+  } catch {
+    return file;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Telas
 // ---------------------------------------------------------------------------
 const VIEWS = {
   start() {
     const c = state.config;
+    const offline = !navigator.onLine;
     const driveBadge = c.driveConnected
       ? '<span class="badge on">✓ Google Drive conectado</span>'
       : c.driveConfigured
@@ -111,16 +136,24 @@ const VIEWS = {
     const aiBadge = c.aiEnabled
       ? '<span class="badge on">✓ Leitura da placa por IA</span>'
       : '<span class="badge off">Entrada manual da placa</span>';
+    const netBadge = offline ? '<span class="badge off">📴 Offline</span>' : '<span class="badge on">🌐 Online</span>';
+
+    const pend = state.pendentes > 0
+      ? `<button class="btn btn-secondary" id="pend" style="margin-top:10px">📥 Pendentes para enviar: ${state.pendentes}</button>`
+      : '';
 
     const el = card(`
       <div class="step-label">Bem-vindo</div>
       <h2>Cadastrar motor em campo</h2>
-      <p class="lead">Vou coletar os dados e as fotos do motor e arquivar tudo de forma padronizada. Uma etapa por vez.</p>
-      <div class="badges">${aiBadge}${driveBadge}</div>
+      <p class="lead">Funciona <strong>offline</strong>: cadastre sem internet que tudo fica salvo no aparelho e é enviado sozinho quando a conexão voltar.</p>
+      <div class="badges">${netBadge}${aiBadge}${driveBadge}</div>
       <button class="btn btn-primary" id="start">Iniciar cadastro</button>
-      ${c.driveConfigured && !c.driveConnected ? '<a class="btn btn-secondary" href="/auth/google" style="margin-top:10px">Conectar Google Drive</a>' : ''}
+      ${pend}
+      ${c.driveConfigured && !c.driveConnected && !offline ? '<a class="btn btn-ghost" href="/auth/google" style="margin-top:6px">Conectar Google Drive</a>' : ''}
     `);
     el.querySelector('#start').onclick = () => go('cliente');
+    const pb = el.querySelector('#pend');
+    if (pb) pb.onclick = () => go('pendentes');
     return el;
   },
 
@@ -196,20 +229,21 @@ const VIEWS = {
   },
 
   lendo() {
-    const el = card(`
+    return card(`
       <div class="center">
         <div class="spinner"></div>
         <h2>Lendo a placa…</h2>
         <p class="lead">Extraindo os dados do motor a partir da foto.</p>
       </div>
     `);
-    return el;
   },
 
   dados() {
     const flagged = new Set(state.naoLegiveis);
     let aviso = '';
-    if (state.aiUsed && flagged.size > 0) {
+    if (state.aiDeferred) {
+      aviso = '<div class="note note-warn">📴 Você está offline. Preencha o que conseguir — a leitura automática da placa será feita na sincronização, e os campos em branco viram "N/D".</div>';
+    } else if (state.aiUsed && flagged.size > 0) {
       aviso = `<div class="note note-warn"><strong>Não consegui ler com segurança:</strong>
         <ul>${[...flagged].map((f) => `<li>${esc(rotulo(f))}</li>`).join('')}</ul>
         Confira na placa e preencha manualmente (ou deixe em branco para "N/D").</div>`;
@@ -347,7 +381,7 @@ const VIEWS = {
 
     const el = card(`
       <div class="step-label">Etapa 8 de 8 · Confirmação</div>
-      <h2>Confira antes de gravar</h2>
+      <h2>Confira antes de salvar</h2>
       <div id="dup"></div>
       <ul class="summary">
         ${linha('Cliente', state.cliente)}
@@ -370,15 +404,15 @@ const VIEWS = {
       </ul>
       <div class="btn-row">
         <button class="btn btn-secondary" id="back">Voltar</button>
-        <button class="btn btn-primary" id="save">Gravar cadastro</button>
+        <button class="btn btn-primary" id="save">Salvar cadastro</button>
       </div>
     `);
 
     el.querySelector('#back').onclick = () => go('extras');
     el.querySelector('#save').onclick = () => salvar();
 
-    // Verifica duplicidade do motor.
-    checkDuplicado(el.querySelector('#dup'));
+    // Verifica duplicidade no servidor (só quando online).
+    if (navigator.onLine) checkDuplicado(el.querySelector('#dup'));
     return el;
   },
 
@@ -386,34 +420,87 @@ const VIEWS = {
     return card(`
       <div class="center">
         <div class="spinner"></div>
-        <h2>Gravando…</h2>
-        <p class="lead">Salvando fotos e dados de forma padronizada.</p>
+        <h2>Salvando no aparelho…</h2>
+        <p class="lead">Guardando fotos e dados localmente.</p>
       </div>
     `);
   },
 
   sucesso() {
     const r = state.result || {};
-    const linkBtn = r.storage === 'drive' && r.link
-      ? `<a class="btn btn-primary" href="${esc(r.link)}" target="_blank" rel="noopener">Abrir pasta no Drive</a>`
-      : r.link
-        ? `<a class="btn btn-primary" href="${esc(r.link)}">Baixar ZIP do cadastro</a>`
-        : '';
+    const synced = r.status === 'sincronizado';
+    const sd = r.synced || {};
+    const status = synced
+      ? `<div class="note note-info">✓ Enviado para ${sd.storage === 'drive' ? 'o Google Drive' : 'o servidor'}.</div>`
+      : '<div class="note note-warn">⏳ Salvo no aparelho. Será enviado automaticamente quando houver internet.</div>';
+
+    let linkBtn = '';
+    if (synced && sd.storage === 'drive' && sd.link) {
+      linkBtn = `<a class="btn btn-primary" href="${esc(sd.link)}" target="_blank" rel="noopener">Abrir pasta no Drive</a>`;
+    } else if (synced && sd.link) {
+      linkBtn = `<a class="btn btn-primary" href="${esc(sd.link)}">Baixar ZIP do cadastro</a>`;
+    }
 
     const el = card(`
-      <div class="success-ico">✅</div>
-      <h2 class="center">Cadastro gravado!</h2>
-      <p class="lead center">${esc(r.folderPath || '')}</p>
-      ${r.storage !== 'drive' ? '<div class="note note-info">Salvo no servidor local. Baixe o ZIP para arquivar no Google Drive.</div>' : ''}
+      <div class="success-ico">${synced ? '✅' : '💾'}</div>
+      <h2 class="center">${synced ? 'Cadastro enviado!' : 'Cadastro salvo no aparelho!'}</h2>
+      <p class="lead center">${esc((synced && sd.folderPath) || r.folderPath || '')}</p>
+      ${status}
       ${linkBtn}
       <button class="btn btn-secondary" id="mesmo" style="margin-top:10px">Cadastrar outro motor (mesmo cliente)</button>
       <button class="btn btn-ghost" id="novo" style="margin-top:6px">Novo cliente</button>
+      ${state.pendentes > 0 ? `<button class="btn btn-ghost" id="pend" style="margin-top:6px">Ver pendentes (${state.pendentes})</button>` : ''}
     `);
     el.querySelector('#mesmo').onclick = () => resetMotor(true);
     el.querySelector('#novo').onclick = () => resetMotor(false);
+    const pb = el.querySelector('#pend');
+    if (pb) pb.onclick = () => go('pendentes');
+    return el;
+  },
+
+  pendentes() {
+    const offline = !navigator.onLine;
+    const el = card(`
+      <div class="step-label">Sincronização</div>
+      <h2>Cadastros no aparelho</h2>
+      ${offline ? '<div class="note note-warn">📴 Sem internet. Os cadastros serão enviados quando a conexão voltar.</div>' : ''}
+      <button class="btn btn-primary" id="sync" ${offline ? 'disabled' : ''}>Sincronizar agora</button>
+      <div id="lista" style="margin-top:14px"><div class="spinner"></div></div>
+      <button class="btn btn-ghost" id="back" style="margin-top:8px">Voltar ao início</button>
+    `);
+    el.querySelector('#back').onclick = () => go('start');
+    el.querySelector('#sync').onclick = async () => {
+      toast('Sincronizando…');
+      await syncPending();
+      toast('Sincronização concluída.');
+    };
+    preencherLista(el.querySelector('#lista'));
     return el;
   },
 };
+
+async function preencherLista(container) {
+  let all = [];
+  try {
+    all = await IDB.getAll();
+  } catch {
+    /* ignore */
+  }
+  all.sort((a, b) => b.createdAt - a.createdAt);
+  if (all.length === 0) {
+    container.innerHTML = '<p class="lead center">Nenhum cadastro no aparelho.</p>';
+    return;
+  }
+  container.innerHTML = `<ul class="summary">${all
+    .map((r) => {
+      const dt = new Date(r.createdAt).toLocaleString('pt-BR');
+      const badge = r.status === 'sincronizado'
+        ? '<span class="badge on">enviado</span>'
+        : '<span class="badge off">pendente</span>';
+      return `<li><span class="k">${esc(r.meta.cliente)} · ${esc(r.meta.motor)}<br><small>${dt}</small></span><span class="v">${badge}</span></li>`;
+    })
+    .join('')}</ul>`;
+}
 
 // ---------------------------------------------------------------------------
 // Componente de foto reutilizável
@@ -464,19 +551,17 @@ function photoStep({ label, title, lead, slot, back, next, onNext }) {
   return el;
 }
 
-function rotulo(key) {
-  const c = CAMPOS.find((x) => x.key === key);
-  return c ? c.label : key;
-}
-
 // ---------------------------------------------------------------------------
-// Ações (rede)
+// Leitura da placa (IA) — só quando online; offline fica para a sincronização
 // ---------------------------------------------------------------------------
 async function startLeitura() {
-  if (!state.config.aiEnabled) {
+  const podeIA = state.config.aiEnabled && navigator.onLine;
+  if (!podeIA) {
     state.aiUsed = false;
     state.dados = emptyDados();
     state.naoLegiveis = [];
+    // Offline mas o servidor tem IA -> leremos a placa na sincronização.
+    state.aiDeferred = state.config.aiEnabled && !navigator.onLine;
     return go('dados');
   }
   go('lendo');
@@ -487,11 +572,13 @@ async function startLeitura() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Falha na leitura.');
     state.aiUsed = Boolean(data.aiEnabled);
+    state.aiDeferred = false;
     state.dados = { ...emptyDados(), ...(data.dados || {}) };
     state.naoLegiveis = data.naoLegiveis || [];
   } catch (err) {
-    toast('Não foi possível ler a placa: ' + err.message);
+    toast('Não foi possível ler a placa agora: ' + err.message);
     state.aiUsed = false;
+    state.aiDeferred = state.config.aiEnabled;
     state.dados = emptyDados();
     state.naoLegiveis = [];
   }
@@ -525,43 +612,116 @@ async function checkDuplicado(container) {
       };
     });
   } catch {
-    /* silencioso: segue como novo cadastro */
+    /* offline ou servidor indisponível: segue como novo cadastro */
   }
 }
 
+// ---------------------------------------------------------------------------
+// Salvar (sempre local, primeiro) + sincronização
+// ---------------------------------------------------------------------------
 async function salvar() {
   go('salvando');
   try {
-    const fd = new FormData();
-    if (state.placa) fd.append('placa', state.placa.file, 'placa.jpg');
-    if (state.panoramica) fd.append('panoramica', state.panoramica.file, 'panoramica.jpg');
-    const extrasNames = [];
-    state.extras.forEach((e, i) => {
-      fd.append('extras', e.file, `extra-${i}.jpg`);
-      extrasNames.push(e.name);
-    });
-    fd.append(
-      'meta',
-      JSON.stringify({
+    const id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const placa = state.placa ? await compressImage(state.placa.file) : null;
+    const panoramica = state.panoramica ? await compressImage(state.panoramica.file) : null;
+    const extras = [];
+    for (const e of state.extras) {
+      extras.push({ name: e.name, blob: await compressImage(e.file) });
+    }
+
+    const record = {
+      id,
+      createdAt: Date.now(),
+      status: 'pendente',
+      meta: {
         cliente: state.cliente,
         motor: state.motor,
         dados: state.dados,
         vezesRebobinado: state.vezesRebobinado,
         observacoes: state.observacoes,
-        extrasNames,
+        extrasNames: state.extras.map((e) => e.name),
         mode: state.existe ? state.mode : 'create',
-      }),
-    );
+        autoLerPlaca: !state.aiUsed, // IA preenche os campos em branco na sincronização
+      },
+      placa,
+      panoramica,
+      extras,
+    };
 
-    const res = await fetch('/api/motor/save', { method: 'POST', body: fd });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Falha ao gravar.');
-    state.result = data;
+    await IDB.add(record);
+    state.result = {
+      id,
+      status: 'pendente',
+      folderPath: `${state.config.rootFolderName} › ${state.cliente} › ${state.motor}`,
+    };
     go('sucesso');
+    await updatePendingBadge();
+    trySync(); // tenta enviar em segundo plano se houver internet
   } catch (err) {
-    toast('Erro ao gravar: ' + err.message);
+    toast('Erro ao salvar no aparelho: ' + err.message);
     go('resumo');
   }
+}
+
+let syncing = false;
+
+async function syncPending() {
+  if (syncing || !navigator.onLine) return;
+  syncing = true;
+  try {
+    const pend = await IDB.getPending();
+    for (const rec of pend) {
+      try {
+        const fd = new FormData();
+        if (rec.placa) fd.append('placa', rec.placa, 'placa.jpg');
+        if (rec.panoramica) fd.append('panoramica', rec.panoramica, 'panoramica.jpg');
+        (rec.extras || []).forEach((e, i) => {
+          if (e.blob) fd.append('extras', e.blob, `extra-${i}.jpg`);
+        });
+        fd.append('meta', JSON.stringify(rec.meta));
+
+        const res = await fetch('/api/motor/save', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Falha ao enviar.');
+
+        // Sucesso: marca como sincronizado e libera as fotos do armazenamento local.
+        await IDB.update(rec.id, {
+          status: 'sincronizado',
+          result: data,
+          syncedAt: Date.now(),
+          placa: null,
+          panoramica: null,
+          extras: (rec.extras || []).map((e) => ({ name: e.name })),
+        });
+        if (state.result && state.result.id === rec.id) {
+          state.result.status = 'sincronizado';
+          state.result.synced = data;
+          if (state.step === 'sucesso') render();
+        }
+      } catch {
+        /* mantém pendente para tentar de novo depois */
+      }
+    }
+  } finally {
+    syncing = false;
+    await updatePendingBadge();
+    if (state.step === 'pendentes') render();
+  }
+}
+
+function trySync() {
+  if (navigator.onLine) syncPending();
+}
+
+async function updatePendingBadge() {
+  try {
+    const pend = await IDB.getPending();
+    state.pendentes = pend.length;
+  } catch {
+    state.pendentes = 0;
+  }
+  if (['start', 'pendentes', 'sucesso'].includes(state.step)) render();
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +735,7 @@ function resetMotor(keepCliente) {
   state.dados = emptyDados();
   state.naoLegiveis = [];
   state.aiUsed = false;
+  state.aiDeferred = false;
   state.vezesRebobinado = '';
   state.extras = [];
   state.observacoes = '';
@@ -593,7 +754,7 @@ async function init() {
     const res = await fetch('/api/config');
     state.config = await res.json();
   } catch {
-    /* usa padrões */
+    /* offline: usa padrões e segue funcionando */
   }
   const params = new URLSearchParams(location.search);
   if (params.get('drive') === 'connected') {
@@ -603,7 +764,15 @@ async function init() {
     toast('Não foi possível conectar ao Google Drive.');
     history.replaceState({}, '', '/');
   }
+
   render();
+  await updatePendingBadge();
+  trySync();
+
+  window.addEventListener('online', () => {
+    toast('Conexão restabelecida — sincronizando…');
+    trySync();
+  });
 }
 
 if ('serviceWorker' in navigator) {

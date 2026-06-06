@@ -98,11 +98,25 @@ app.post(
       extras.push({ ...processed, name: extrasNames[i] || `Foto adicional ${i + 1}` });
     }
 
+    // Leitura adiada da placa: quando o cadastro foi feito offline (autoLerPlaca),
+    // a IA preenche aqui, na sincronização, apenas os campos que ficaram em branco.
+    let dados = meta.dados || {};
+    if (meta.autoLerPlaca && placa && config.gemini.enabled) {
+      try {
+        const r = await lerPlaca(placa.buffer);
+        for (const k of Object.keys(r.dados)) {
+          if (!dados[k] || String(dados[k]).trim() === '') dados[k] = r.dados[k];
+        }
+      } catch (e) {
+        console.error('Leitura adiada da placa falhou:', e.message);
+      }
+    }
+
     const backend = await pickBackend();
     const result = await backend.salvarMotor({
       cliente,
       motor,
-      dados: meta.dados || {},
+      dados,
       vezesRebobinado: meta.vezesRebobinado,
       observacoes: meta.observacoes,
       placa,
